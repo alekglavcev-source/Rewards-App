@@ -1,0 +1,141 @@
+const express = require('express');
+const sqlite3 = require('sqlite3').verbose();
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const cors = require('cors');
+const cookieParser = require('cookie-parser');
+const rateLimit = require('express-rate-limit');
+
+const app = express();
+app.use(express.json());
+app.use(cors({ origin: true, credentials: true }));
+app.use(cookieParser());
+
+const limiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 100 });
+app.use(limiter);
+
+const SECRET = "supersecretkey";
+
+// DB
+const db = new sqlite3.Database('./db.sqlite');
+
+db.serialize(() => {
+  db.run(`CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT UNIQUE,
+    password TEXT,
+    coins INTEGER DEFAULT 0,
+    lastClaim INTEGER DEFAULT 0,
+    referralCode TEXT,
+    referredBy TEXT,
+    isAdmin INTEGER DEFAULT 0
+  )`);
+});
+
+// AUTO ADMIN
+(async () => {
+  const hash = await bcrypt.hash("arhnhb83bkana9n4", 10);
+  db.run(`INSERT OR IGNORE INTO users (username, password, isAdmin) VALUES ('godking3000', ?, 1)`, [hash]);
+})();
+
+// AUTH
+function auth(req, res, next) {
+  const token = req.cookies.token;
+  if (!token) return res.sendStatus(401);
+  jwt.verify(token, SECRET, (err, user) => {
+    if (err) return res.sendStatus(403);
+    req.user = user;
+    next();
+  });
+}
+
+function validPassword(pw) {
+  return pw.length >= 6;
+}
+
+// REGISTER
+app.post('/api/register', async (req, res) => {
+  const { username, password, referral } = req.body;
+  if (!validPassword(password)) return res.status(400).send("Weak password");
+
+  const hash = await bcrypt.hash(password, 10);
+  const referralCode = Math.random().toString(36).substring(2, 8);
+
+  db.run(
+    `INSERT INTO users (username, password, referralCode, referredBy) VALUES (?, ?, ?, ?)`,
+    [username, hash, referralCode, referral],
+    function (err) {
+      if (err) return res.status(400).send("User exists");
+
+      if (referral) {
+        db.run(`UPDATE users SET coins = coins + 100 WHERE referralCode=?`, [referral]);
+      }
+
+      res.send("Registered");
+    }
+  );
+});
+
+// LOGIN
+app.post('/api/login', (req, res) => {
+  const { username, password } = req.body;
+  db.get(`SELECT * FROM users WHERE username=?`, [username], async (err, user) => {
+    if (!user) return res.status(400).send("No user");
+
+    const match = await bcrypt.compare(password, user.password);
+    if (!match) return res.status(403).send("Wrong pass");
+
+    const token = jwt.sign({ id: user.id, isAdmin: user.isAdmin }, SECRET);
+    res.cookie("token", token, {
+      httpOnly: true,
+      secure: true,
+      sameSite: "None"
+    });
+    res.send("Logged in");
+  });
+});
+
+// PROFILE
+app.get('/api/me', auth, (req, res) => {
+  db.get(`SELECT username, coins, referralCode FROM users WHERE id=?`, [req.user.id], (err, user) => {
+    res.json(user);
+  });
+});
+
+// DAILY
+app.post('/api/daily', auth, (req, res) => {
+  const now = Date.now();
+  db.get(`SELECT lastClaim, coins FROM users WHERE id=?`, [req.user.id], (err, user) => {
+    if (now - user.lastClaim < 86400000) return res.status(400).send("Wait 24h");
+
+    const coins = user.coins + 50;
+    db.run(`UPDATE users SET coins=?, lastClaim=? WHERE id=?`, [coins, now, req.user.id]);
+    res.json({ coins });
+  });
+});
+
+// TASK
+app.post('/api/task', auth, (req, res) => {
+  db.run(`UPDATE users SET coins = coins + 20 WHERE id=?`, [req.user.id]);
+  res.send("Task complete");
+});
+
+// LEADERBOARD
+app.get('/api/leaderboard', (req, res) => {
+  db.all(`SELECT username, coins FROM users ORDER BY coins DESC LIMIT 10`, [], (err, rows) => {
+    res.json(rows);
+  });
+});
+
+// ADMIN
+app.post('/api/admin/give', auth, (req, res) => {
+  if (!req.user.isAdmin) return res.sendStatus(403);
+  const { username, amount } = req.body;
+  db.run(`UPDATE users SET coins = coins + ? WHERE username=?`, [amount, username]);
+  res.send("Given");
+});
+
+app.use(express.static('public'));
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log("Running on http://localhost:" + PORT));
